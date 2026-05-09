@@ -5,7 +5,7 @@ import { transcribe } from './stt.js'
 import { chat, type Message } from './llm.js'
 import { synthesize } from './tts.js'
 import { elapsedMs, nowMs, withTiming } from './timing.js'
-import { storeMemory, retrieveMemories } from './memory.js'
+import { storeMemory, retrieveMemories, formatMemoryContext } from './memory.js'
 
 type State = 'idle' | 'listening' | 'processing'
 
@@ -173,12 +173,9 @@ export class Session {
         this.messages.push({ role: 'user', content: text })
         let llmMessages: Message[] = this.messages
         if (memories.length > 0) {
-            const memoryText = memories
-                .map((m, i) => `${i + 1}. ユーザー:「${m.user}」→ スタックちゃん:「${m.assistant}」`)
-                .join('\n')
             llmMessages = [
                 this.messages[0],
-                { role: 'system', content: `【関連する過去の会話】\n${memoryText}` },
+                { role: 'system', content: `【関連する過去の会話・資料】\n${formatMemoryContext(memories)}` },
                 ...this.messages.slice(1),
             ]
             console.log(`[session ${this.sessionId}] injecting ${memories.length} memories`)

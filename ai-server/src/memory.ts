@@ -12,6 +12,24 @@ const scoreThreshold = () => Number(process.env.MEMORY_SCORE_THRESHOLD ?? '0.7')
 let qdrantClient: QdrantClient | null = null
 let openaiClient: OpenAI | null = null
 
+export type ConversationMemory = {
+    type: 'conversation'
+    user: string
+    assistant: string
+    timestamp: string
+}
+
+export type DocumentMemory = {
+    type: 'document'
+    content: string    // 元のチャンクテキスト（コンテキスト注入用）
+    summary: string    // LLM生成サマリー（embedding用）
+    filename: string
+    chunkIndex: number
+    timestamp: string
+}
+
+export type MemoryEntry = ConversationMemory | DocumentMemory
+
 function isEnabled(): boolean {
     return !!process.env.QDRANT_URL
 }
@@ -41,10 +59,51 @@ async function createEmbedding(text: string): Promise<number[]> {
     return response.data[0].embedding
 }
 
-export type MemoryEntry = {
-    user: string
-    assistant: string
-    timestamp: string
+function normalizePayload(payload: Record<string, unknown>): MemoryEntry {
+    if (payload['type'] === 'document') {
+        return {
+            type: 'document',
+            content: (payload['content'] as string) ?? '',
+            summary: (payload['summary'] as string) ?? (payload['content'] as string) ?? '',
+            filename: (payload['filename'] as string) ?? '',
+            chunkIndex: (payload['chunkIndex'] as number) ?? 0,
+            timestamp: (payload['timestamp'] as string) ?? '',
+        }
+    }
+    return {
+        type: 'conversation',
+        user: (payload['user'] as string) ?? '',
+        assistant: (payload['assistant'] as string) ?? '',
+        timestamp: (payload['timestamp'] as string) ?? '',
+    }
+}
+
+function splitIntoChunks(text: string, maxChunkSize = 500): string[] {
+    const paragraphs = text.split(/\n\n+/).filter(p => p.trim())
+    const chunks: string[] = []
+    let current = ''
+
+    for (const para of paragraphs) {
+        if (current.length + para.length > maxChunkSize && current) {
+            chunks.push(current.trim())
+            current = para
+        } else {
+            current = current ? `${current}\n\n${para}` : para
+        }
+    }
+    if (current.trim()) chunks.push(current.trim())
+
+    return chunks.length ? chunks : [text.slice(0, maxChunkSize)]
+}
+
+export function formatMemoryContext(memories: MemoryEntry[]): string {
+    return memories.map((m, i) => {
+        if (m.type === 'document') {
+            // 元テキストをコンテキストとして使用（サマリーは検索用のみ）
+            return `${i + 1}. 参考資料「${m.filename}」:\n${m.content}`
+        }
+        return `${i + 1}. ユーザー:「${m.user}」→ スタックちゃん:「${m.assistant}」`
+    }).join('\n')
 }
 
 export async function initMemoryCollection(): Promise<void> {
@@ -77,16 +136,70 @@ export async function storeMemory(userMsg: string, assistantMsg: string): Promis
                 id: randomUUID(),
                 vector,
                 payload: {
+                    type: 'conversation',
                     user: userMsg,
                     assistant: assistantMsg,
                     timestamp: new Date().toISOString(),
-                } satisfies MemoryEntry,
+                } satisfies ConversationMemory,
             }],
         })
-        console.log(`[memory] stored: "${userMsg.slice(0, 30)}..."`)
+        console.log(`[memory] stored conversation: "${userMsg.slice(0, 30)}..."`)
     } catch (err) {
         console.error('[memory] storeMemory failed:', err)
     }
+}
+
+async function summarizeChunk(chunk: string): Promise<string> {
+    try {
+        const response = await getOpenAIClient().chat.completions.create({
+            model: process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
+            messages: [{
+                role: 'user',
+                content: `以下のテキストを、検索に最適化した1〜2文の日本語で要約してください。重要な固有名詞・数値・手順は必ず含めてください。\n\n${chunk}`,
+            }],
+        })
+        return response.choices[0]?.message.content ?? chunk
+    } catch (err) {
+        console.warn('[memory] summarizeChunk failed, using raw chunk:', err)
+        return chunk
+    }
+}
+
+export async function storeDocument(
+    text: string,
+    filename: string,
+    onProgress?: (current: number, total: number) => void,
+): Promise<number> {
+    if (!isEnabled()) throw new Error('QDRANT_URL not configured')
+    const chunks = splitIntoChunks(text)
+    console.log(`[memory] processing document "${filename}" (${chunks.length} chunks)`)
+
+    for (let i = 0; i < chunks.length; i++) {
+        onProgress?.(i + 1, chunks.length)
+
+        const summary = await summarizeChunk(chunks[i])
+        console.log(`[memory] chunk ${i + 1}/${chunks.length} summary: "${summary.slice(0, 60)}..."`)
+
+        const vector = await createEmbedding(summary)
+        await getQdrantClient().upsert(COLLECTION_NAME, {
+            wait: false,
+            points: [{
+                id: randomUUID(),
+                vector,
+                payload: {
+                    type: 'document',
+                    content: chunks[i],
+                    summary,
+                    filename,
+                    chunkIndex: i,
+                    timestamp: new Date().toISOString(),
+                } satisfies DocumentMemory,
+            }],
+        })
+    }
+
+    console.log(`[memory] stored document "${filename}" (${chunks.length} chunks)`)
+    return chunks.length
 }
 
 export async function retrieveMemories(query: string): Promise<MemoryEntry[]> {
@@ -99,9 +212,25 @@ export async function retrieveMemories(query: string): Promise<MemoryEntry[]> {
             score_threshold: scoreThreshold(),
             with_payload: true,
         })
-        return results.map(r => r.payload as MemoryEntry)
+        return results.map(r => normalizePayload(r.payload as Record<string, unknown>))
     } catch (err) {
         console.error('[memory] retrieveMemories failed:', err)
+        return []
+    }
+}
+
+export async function listMemories(limit = 50): Promise<MemoryEntry[]> {
+    if (!isEnabled()) return []
+    try {
+        const result = await getQdrantClient().scroll(COLLECTION_NAME, {
+            limit,
+            with_payload: true,
+        })
+        return result.points
+            .map(p => normalizePayload(p.payload as Record<string, unknown>))
+            .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    } catch (err) {
+        console.error('[memory] listMemories failed:', err)
         return []
     }
 }
