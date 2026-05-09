@@ -5,6 +5,7 @@ import { transcribe } from './stt.js'
 import { chat, type Message } from './llm.js'
 import { synthesize } from './tts.js'
 import { elapsedMs, nowMs, withTiming } from './timing.js'
+import { storeMemory, retrieveMemories } from './memory.js'
 
 type State = 'idle' | 'listening' | 'processing'
 
@@ -161,16 +162,38 @@ export class Session {
 
         if (!text.trim()) return
 
-        // 2. LLM
+        // 2. 関連する過去の記憶を取得
+        const memories = await withTiming(
+            `session:${this.sessionId}:memory.retrieve`,
+            () => retrieveMemories(text),
+            { query: text.slice(0, 30) },
+        )
+
+        // 3. LLM（記憶をコンテキストに注入）
         this.messages.push({ role: 'user', content: text })
+        let llmMessages: Message[] = this.messages
+        if (memories.length > 0) {
+            const memoryText = memories
+                .map((m, i) => `${i + 1}. ユーザー:「${m.user}」→ スタックちゃん:「${m.assistant}」`)
+                .join('\n')
+            llmMessages = [
+                this.messages[0],
+                { role: 'system', content: `【関連する過去の会話】\n${memoryText}` },
+                ...this.messages.slice(1),
+            ]
+            console.log(`[session ${this.sessionId}] injecting ${memories.length} memories`)
+        }
         const reply = await withTiming(
             `session:${this.sessionId}:llm`,
-            () => chat(this.messages),
-            { messageCount: this.messages.length },
+            () => chat(llmMessages),
+            { messageCount: llmMessages.length, memories: memories.length },
         )
         this.messages.push({ role: 'assistant', content: reply })
         console.log(`[session ${this.sessionId}] LLM: "${reply}"`)
         this.sendJson({ type: 'llm', emotion: 'neutral' })
+
+        // 会話をQdrantに保存（非同期・fire-and-forget）
+        storeMemory(text, reply)
 
         // 3. TTS → Opus → device
         const wav = await withTiming(

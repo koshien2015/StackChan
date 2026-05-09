@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { startServer } from './server.js'
+import { initMemoryCollection } from './memory.js'
 
 const PORT = Number(process.env.PORT ?? '8765')
 
@@ -8,4 +9,4 @@ if (!process.env.OPENAI_API_KEY) {
     process.exit(1)
 }
 
-startServer(PORT)
+initMemoryCollection().then(() => startServer(PORT))
