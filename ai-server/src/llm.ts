@@ -5,6 +5,8 @@ import { withTiming } from './timing.js'
 export type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
 let client: OpenAI | null = null
+// セッション内でツール対応を確認済みかどうかのフラグ（null=未確認）
+let toolsSupported: boolean | null = null
 
 function getClient(): OpenAI {
     if (!client) {
@@ -16,18 +18,54 @@ function getClient(): OpenAI {
     return client
 }
 
-export async function chat(messages: Message[]): Promise<string> {
-    const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
-    const response = await withTiming(
+function isToolsNotSupportedError(err: unknown): boolean {
+    const msg = String(err).toLowerCase()
+    return msg.includes('tool') || msg.includes('function call')
+}
+
+async function callWithTools(
+    model: string,
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+    return withTiming(
         'llm.chat.initial',
-        () => getClient().chat.completions.create({
-            model,
-            messages,
-            tools: TOOLS,
-            tool_choice: 'auto',
-        }),
+        () => getClient().chat.completions.create({ model, messages, tools: TOOLS, tool_choice: 'auto' }),
         { model, messageCount: messages.length },
     )
+}
+
+async function callWithoutTools(
+    model: string,
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+    return withTiming(
+        'llm.chat',
+        () => getClient().chat.completions.create({ model, messages }),
+        { model, messageCount: messages.length },
+    )
+}
+
+export async function chat(messages: Message[]): Promise<string> {
+    const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
+    const canUseTools = TOOLS.length > 0 && toolsSupported !== false
+
+    let response: OpenAI.Chat.Completions.ChatCompletion
+    if (canUseTools) {
+        try {
+            response = await callWithTools(model, messages)
+            toolsSupported = true
+        } catch (err) {
+            if (isToolsNotSupportedError(err)) {
+                console.warn('[llm] model does not support tools, disabling for this session')
+                toolsSupported = false
+                response = await callWithoutTools(model, messages)
+            } else {
+                throw err
+            }
+        }
+    } else {
+        response = await callWithoutTools(model, messages)
+    }
 
     const choice = response.choices[0]
 
@@ -54,10 +92,7 @@ export async function chat(messages: Message[]): Promise<string> {
 
         const final = await withTiming(
             'llm.chat.final',
-            () => getClient().chat.completions.create({
-                model,
-                messages: extended,
-            }),
+            () => getClient().chat.completions.create({ model, messages: extended }),
             { model, messageCount: extended.length },
         )
         return final.choices[0]?.message.content ?? ''
