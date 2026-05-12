@@ -1,7 +1,8 @@
+import { chatSimple, type Message } from './llm.js'
+import { retrieveMemories, formatMemoryContext } from './memory.js'
 import type { SpontaneousSpeechType } from './device-context.js'
 
-// Phase 1: 定型発話のみ（LLM不要）
-// Phase 2以降でretrieveMemoriesを使った雑談生成を追加予定
+const MAX_UTTERANCE_CHARS = 90
 
 const MORNING_GREETINGS = [
   'おはようございます！今日もよい一日を。',
@@ -9,7 +10,7 @@ const MORNING_GREETINGS = [
   'おはようございます。今日も元気にいきましょう。',
 ]
 
-const CHECKIN_PHRASES = [
+const CHECKIN_FALLBACK = [
   'ちょっと一休みしませんか？',
   '最近どうですか？',
   'そろそろ休憩でもどうですか。',
@@ -20,10 +21,58 @@ function pick(arr: string[]): string {
   return arr[Math.floor(Math.random() * arr.length)]
 }
 
+function formatTime(d: Date): string {
+  return `${d.getHours()}時${d.getMinutes()}分`
+}
+
+async function buildLlmCheckin(): Promise<string> {
+  const memories = await retrieveMemories('最近の会話 ユーザーの様子 話題 好み', 3)
+  const memoryContext = memories.length > 0
+    ? formatMemoryContext(memories)
+    : '（直近の記憶なし）'
+
+  const messages: Message[] = [
+    {
+      role: 'system',
+      content: [
+        'あなたは卓上ロボット「StackChan」です。',
+        'ユーザーに短く自然に話しかけてください。',
+        '1〜2文、質問するなら1つだけにしてください。',
+        '説教・長い説明は禁止です。',
+        `${MAX_UTTERANCE_CHARS}文字以内で答えてください。`,
+        '発話文のみを返してください（前置き・説明不要）。',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        `現在時刻: ${formatTime(new Date())}`,
+        '',
+        '直近の会話・記憶:',
+        memoryContext,
+      ].join('\n'),
+    },
+  ]
+
+  const text = await chatSimple(messages)
+  return text.trim().slice(0, MAX_UTTERANCE_CHARS)
+}
+
 export async function buildUtterance(reason: SpontaneousSpeechType): Promise<string | null> {
   switch (reason) {
-    case 'greeting': return pick(MORNING_GREETINGS)
-    case 'checkin': return pick(CHECKIN_PHRASES)
-    default: return null
+    case 'greeting':
+      return pick(MORNING_GREETINGS)
+
+    case 'checkin': {
+      try {
+        return await buildLlmCheckin()
+      } catch (err) {
+        console.warn('[brain] LLM checkin failed, using fallback:', err)
+        return pick(CHECKIN_FALLBACK)
+      }
+    }
+
+    default:
+      return null
   }
 }

@@ -100,3 +100,9 @@ export async function chat(messages: Message[]): Promise<string> {
 
     return choice.message.content ?? ''
 }
+
+export async function chatSimple(messages: Message[]): Promise<string> {
+    const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
+    const response = await callWithoutTools(model, messages)
+    return response.choices[0]?.message.content ?? ''
+}

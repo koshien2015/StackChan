@@ -5,7 +5,8 @@ import { transcribe } from './stt.js'
 import { chat, type Message } from './llm.js'
 import { synthesize } from './tts.js'
 import { elapsedMs, nowMs, withTiming } from './timing.js'
-import { storeMemory, retrieveMemories, formatMemoryContext } from './memory.js'
+import { retrieveMemories, formatMemoryContext } from './memory.js'
+import { extractAndStoreMemories } from './memory-writer.js'
 
 type State = 'idle' | 'listening' | 'processing'
 
@@ -211,8 +212,8 @@ export class Session {
         console.log(`[session ${this.sessionId}] LLM: "${reply}"`)
         this.sendJson({ type: 'llm', emotion: 'neutral' })
 
-        // 会話をQdrantに保存（非同期・fire-and-forget）
-        storeMemory(text, reply)
+        // 会話ログ保存 + 構造化記憶抽出（非同期・fire-and-forget）
+        extractAndStoreMemories(text, reply)
 
         // 3. TTS → Opus → device
         const wav = await withTiming(

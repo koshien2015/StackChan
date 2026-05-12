@@ -301,13 +301,13 @@ export async function storeDocument(
     return chunks.length
 }
 
-export async function retrieveMemories(query: string): Promise<MemoryEntry[]> {
+export async function retrieveMemories(query: string, limit?: number): Promise<MemoryEntry[]> {
     if (!isEnabled()) return []
     try {
         const vector = await createEmbedding(query)
         const results = await getQdrantClient().search(COLLECTION_NAME, {
             vector,
-            limit: memoryLimit(),
+            limit: limit ?? memoryLimit(),
             score_threshold: scoreThreshold(),
             with_payload: true,
         })
