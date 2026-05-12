@@ -17,12 +17,51 @@ const CHECKIN_FALLBACK = [
   '作業、うまくいってますか？',
 ]
 
+const REACTION_FALLBACK = [
+  'あ、いたんですか！気づかなかった。',
+  'おや、こんにちは。',
+  'いらっしゃい！',
+  'やあ、気づいてなかった。何かありましたか？',
+]
+
 function pick(arr: string[]): string {
   return arr[Math.floor(Math.random() * arr.length)]
 }
 
 function formatTime(d: Date): string {
   return `${d.getHours()}時${d.getMinutes()}分`
+}
+
+async function buildLlmReaction(): Promise<string> {
+  const memories = await retrieveMemories('挨拶 ユーザー 人 存在', 2)
+  const memoryContext = memories.length > 0
+    ? formatMemoryContext(memories)
+    : '（直近の記憶なし）'
+
+  const messages: Message[] = [
+    {
+      role: 'system',
+      content: [
+        'あなたは卓上ロボット「StackChan」です。',
+        'カメラで近くに人がいることに気づきました。',
+        '自然な一言で話しかけてください。1文のみ。',
+        `${MAX_UTTERANCE_CHARS}文字以内で答えてください。`,
+        '発話文のみを返してください。',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: [
+        `現在時刻: ${formatTime(new Date())}`,
+        '',
+        '直近の記憶:',
+        memoryContext,
+      ].join('\n'),
+    },
+  ]
+
+  const text = await chatSimple(messages)
+  return text.trim().slice(0, MAX_UTTERANCE_CHARS)
 }
 
 async function buildLlmCheckin(): Promise<string> {
@@ -69,6 +108,15 @@ export async function buildUtterance(reason: SpontaneousSpeechType): Promise<str
       } catch (err) {
         console.warn('[brain] LLM checkin failed, using fallback:', err)
         return pick(CHECKIN_FALLBACK)
+      }
+    }
+
+    case 'reaction': {
+      try {
+        return await buildLlmReaction()
+      } catch (err) {
+        console.warn('[brain] LLM reaction failed, using fallback:', err)
+        return pick(REACTION_FALLBACK)
       }
     }
 

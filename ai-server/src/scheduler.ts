@@ -1,8 +1,12 @@
 import type { AgentOrchestrator } from './orchestrator.js'
 import type { DeviceRegistry } from './device-context.js'
+import { captureImage, detectPresence, isCameraEnabled } from './camera-tool.js'
+import { storeObservation } from './memory.js'
 
 const TICK_INTERVAL_MS = 60_000
-const CHECKIN_SILENCE_MS = 60 * 60 * 1000  // 1時間
+const CHECKIN_SILENCE_MS = 60 * 60 * 1000      // 1時間
+const CAMERA_OBSERVATION_TTL_SEC = 10 * 60     // 観測の有効期限: 10分
+const CAMERA_TICK_EVERY = 5                    // 5tick(=5分)ごとに撮影
 
 interface SchedulerJob {
   id: string
@@ -47,10 +51,40 @@ class CheckinJob implements SchedulerJob {
   }
 }
 
+class CameraObservationJob implements SchedulerJob {
+  readonly id = 'camera-observation'
+  private tickCount = 0
+
+  async run(now: Date, orchestrator: AgentOrchestrator): Promise<void> {
+    this.tickCount++
+    if (this.tickCount % CAMERA_TICK_EVERY !== 0) return
+    if (!isCameraEnabled()) return
+
+    try {
+      const image = await captureImage()
+      const presence = await detectPresence(image)
+
+      if (presence) {
+        await storeObservation('人が近くにいる（カメラで検知）', CAMERA_OBSERVATION_TTL_SEC, {
+          topic: 'presence',
+          source: 'camera_observation',
+        })
+        console.log('[scheduler] camera: presence detected, triggering reaction')
+        await orchestrator.maybeSpeakAll('reaction')
+      } else {
+        console.log('[scheduler] camera: no presence detected')
+      }
+    } catch (err) {
+      console.error('[scheduler] camera-observation error:', err)
+    }
+  }
+}
+
 export class Scheduler {
   private readonly jobs: SchedulerJob[] = [
     new MorningGreetingJob(),
     new CheckinJob(),
+    new CameraObservationJob(),
   ]
   private interval?: ReturnType<typeof setInterval>
 
