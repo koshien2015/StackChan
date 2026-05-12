@@ -41,7 +41,7 @@ export class Session {
     }
 
     public async sendTtsAudio(opusFrames: Buffer[], text: string): Promise<void> {
-        this.sendJson({ type: 'tts', state: 'start' })
+        this.sendJson({ type: 'tts', state: 'start', autonomous: true })
         this.sendJson({ type: 'tts', state: 'sentence_start', text })
         const streamStartMs = nowMs()
         for (const frame of opusFrames) {
