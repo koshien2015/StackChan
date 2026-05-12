@@ -12,6 +12,12 @@ const scoreThreshold = () => Number(process.env.MEMORY_SCORE_THRESHOLD ?? '0.7')
 let qdrantClient: QdrantClient | null = null
 let openaiClient: OpenAI | null = null
 
+// Phase A: 既存フィールドを維持しつつ新フィールドを追加
+
+export type MemoryType = 'fact' | 'preference' | 'episode' | 'observation'
+export type MemorySource = 'user_direct' | 'tool_result' | 'assistant_reply' | 'camera_observation' | 'inference' | 'legacy'
+export type MemoryStatus = 'verified' | 'unverified' | 'deprecated'
+
 export type ConversationMemory = {
     type: 'conversation'
     user: string
@@ -29,6 +35,24 @@ export type DocumentMemory = {
 }
 
 export type MemoryEntry = ConversationMemory | DocumentMemory
+
+export type NewMemoryPayload = {
+    memoryType: MemoryType
+    source: MemorySource
+    status: MemoryStatus
+    confidence: number
+    text: string
+    topic?: string
+    createdAt: string
+    expiresAt?: string | null
+    supersedes?: string | null
+}
+
+function isAliveMemory(payload: Record<string, unknown>): boolean {
+    const expiresAt = payload['expiresAt'] as string | null | undefined
+    if (!expiresAt) return true
+    return new Date(expiresAt).getTime() > Date.now()
+}
 
 function isEnabled(): boolean {
     return !!process.env.QDRANT_URL
@@ -130,6 +154,40 @@ export async function storeMemory(userMsg: string, assistantMsg: string): Promis
     try {
         const text = `ユーザー: ${userMsg}\nスタックちゃん: ${assistantMsg}`
         const vector = await createEmbedding(text)
+        const now = new Date().toISOString()
+        await getQdrantClient().upsert(COLLECTION_NAME, {
+            wait: false,
+            points: [{
+                id: randomUUID(),
+                vector,
+                payload: {
+                    // 後方互換フィールド
+                    type: 'conversation',
+                    user: userMsg,
+                    assistant: assistantMsg,
+                    timestamp: now,
+                    // 新スキーマフィールド
+                    memoryType: 'episode' as MemoryType,
+                    source: 'assistant_reply' as MemorySource,
+                    status: 'unverified' as MemoryStatus,
+                    confidence: 0.4,
+                    text,
+                    createdAt: now,
+                    expiresAt: null,
+                },
+            }],
+        })
+        console.log(`[memory] stored conversation: "${userMsg.slice(0, 30)}..."`)
+    } catch (err) {
+        console.error('[memory] storeMemory failed:', err)
+    }
+}
+
+export async function storeFact(text: string, meta: Partial<NewMemoryPayload> = {}): Promise<void> {
+    if (!isEnabled()) return
+    try {
+        const vector = await createEmbedding(text)
+        const now = new Date().toISOString()
         await getQdrantClient().upsert(COLLECTION_NAME, {
             wait: false,
             points: [{
@@ -137,15 +195,56 @@ export async function storeMemory(userMsg: string, assistantMsg: string): Promis
                 vector,
                 payload: {
                     type: 'conversation',
-                    user: userMsg,
-                    assistant: assistantMsg,
-                    timestamp: new Date().toISOString(),
-                } satisfies ConversationMemory,
+                    user: '',
+                    assistant: '',
+                    timestamp: now,
+                    memoryType: 'fact' as MemoryType,
+                    source: 'user_direct' as MemorySource,
+                    status: 'verified' as MemoryStatus,
+                    confidence: 0.9,
+                    text,
+                    createdAt: now,
+                    expiresAt: null,
+                    ...meta,
+                },
             }],
         })
-        console.log(`[memory] stored conversation: "${userMsg.slice(0, 30)}..."`)
+        console.log(`[memory] stored fact: "${text.slice(0, 40)}..."`)
     } catch (err) {
-        console.error('[memory] storeMemory failed:', err)
+        console.error('[memory] storeFact failed:', err)
+    }
+}
+
+export async function storeObservation(text: string, ttlSec: number, meta: Partial<NewMemoryPayload> = {}): Promise<void> {
+    if (!isEnabled()) return
+    try {
+        const vector = await createEmbedding(text)
+        const now = new Date().toISOString()
+        const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString()
+        await getQdrantClient().upsert(COLLECTION_NAME, {
+            wait: false,
+            points: [{
+                id: randomUUID(),
+                vector,
+                payload: {
+                    type: 'conversation',
+                    user: '',
+                    assistant: '',
+                    timestamp: now,
+                    memoryType: 'observation' as MemoryType,
+                    source: 'camera_observation' as MemorySource,
+                    status: 'unverified' as MemoryStatus,
+                    confidence: 0.7,
+                    text,
+                    createdAt: now,
+                    expiresAt,
+                    ...meta,
+                },
+            }],
+        })
+        console.log(`[memory] stored observation (ttl=${ttlSec}s): "${text.slice(0, 40)}..."`)
+    } catch (err) {
+        console.error('[memory] storeObservation failed:', err)
     }
 }
 
@@ -212,7 +311,13 @@ export async function retrieveMemories(query: string): Promise<MemoryEntry[]> {
             score_threshold: scoreThreshold(),
             with_payload: true,
         })
-        return results.map(r => normalizePayload(r.payload as Record<string, unknown>))
+        return results
+            .filter(r => {
+                const p = r.payload as Record<string, unknown>
+                if (p['status'] === 'deprecated') return false
+                return isAliveMemory(p)
+            })
+            .map(r => normalizePayload(r.payload as Record<string, unknown>))
     } catch (err) {
         console.error('[memory] retrieveMemories failed:', err)
         return []

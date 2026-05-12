@@ -31,7 +31,27 @@ export class Session {
     private maxDurationTimer?: ReturnType<typeof setTimeout>
     private cooldownUntil = 0
 
+    public onUserSpoke?: () => void
+
     constructor(private readonly ws: WebSocket) {}
+
+    public getTransportState(): State {
+        return this.state
+    }
+
+    public async sendTtsAudio(opusFrames: Buffer[], text: string): Promise<void> {
+        this.sendJson({ type: 'tts', state: 'start' })
+        this.sendJson({ type: 'tts', state: 'sentence_start', text })
+        const streamStartMs = nowMs()
+        for (const frame of opusFrames) {
+            this.sendBinary(wrapOpusPayload(frame, this.version))
+            await new Promise(resolve => setTimeout(resolve, OUTPUT_FRAME_DURATION_MS))
+        }
+        console.log(`[timing] done session:${this.sessionId}:tts.stream(autonomous) elapsed=${elapsedMs(streamStartMs)} frames=${opusFrames.length}`)
+        this.sendJson({ type: 'tts', state: 'sentence_end', text })
+        this.sendJson({ type: 'tts', state: 'stop' })
+        this.cooldownUntil = Date.now() + POST_TTS_COOLDOWN_MS
+    }
 
     handleMessage(data: Buffer | string): void {
         if (typeof data === 'string') {
@@ -161,6 +181,8 @@ export class Session {
         this.sendJson({ type: 'stt', text })
 
         if (!text.trim()) return
+
+        this.onUserSpoke?.()
 
         // 2. 関連する過去の記憶を取得
         const memories = await withTiming(
